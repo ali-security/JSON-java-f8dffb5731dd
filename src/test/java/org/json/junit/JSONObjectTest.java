@@ -1434,6 +1434,109 @@ public class JSONObjectTest {
     }
 
     /**
+     * Verifies that getBigInteger / optBigInteger do not attempt to materialise a
+     * BigInteger whose decimal representation would exceed 1000 digits. A short
+     * exponent-notation literal such as 1e100000000 is stored compactly as a
+     * BigDecimal at parse time but would otherwise expand to ~100 000 000 digits
+     * in BigDecimal.toBigInteger(), stalling the thread / OOM (CVE-2026-59171).
+     */
+    @Test(timeout = 5000)
+    public void getBigIntegerHugeExponentReturnsDefault() {
+        // BigDecimal path: value arrives via the parser as a BigDecimal
+        JSONObject jo = new JSONObject("{\"x\":1e100000000}");
+        assertTrue("huge-exponent literal parses to BigDecimal", jo.get("x") instanceof BigDecimal);
+        assertNull("optBigInteger returns default for huge exponent", jo.optBigInteger("x", null));
+        try {
+            jo.getBigInteger("x");
+            fail("getBigInteger should throw for huge exponent");
+        } catch (JSONException expected) {
+        }
+
+        // String path: value put() as a String, exercised via objectToBigInteger's
+        // isDecimalNotation branch
+        JSONObject jo2 = new JSONObject();
+        jo2.put("x", "1e100000000");
+        assertNull("optBigInteger returns default for huge-exponent string", jo2.optBigInteger("x", null));
+
+        // JSONArray accessors delegate to the same helper
+        JSONArray ja = new JSONArray("[1e100000000]");
+        assertTrue("optBigInteger returns default for huge exponent (array)",
+                BigInteger.ONE.equals(ja.optBigInteger(0, BigInteger.ONE)));
+
+        // Boundary: a value at the limit still converts correctly
+        JSONObject jo3 = new JSONObject("{\"x\":1e999}");
+        assertEquals("1e999 still converts", 0,
+                jo3.getBigInteger("x").compareTo(BigInteger.TEN.pow(999)));
+    }
+
+    /**
+     * Exploit regression for CVE-2026-59171: the remaining huge-exponent
+     * accessor forms. Every conversion must return (or throw) promptly instead
+     * of materialising a ~100 000 000 digit integer.
+     */
+    @Test(timeout = 5000)
+    public void getBigIntegerHugeExponentAllAccessorsReturnPromptly() {
+        // JSONArray.getBigInteger throws instead of hanging
+        JSONArray ja = new JSONArray("[1e100000000, -1e100000000]");
+        try {
+            ja.getBigInteger(0);
+            fail("getBigInteger should throw for huge exponent (array)");
+        } catch (JSONException expected) {
+        }
+        // negative huge-exponent values are bounded the same way
+        assertNull("negative huge exponent (array)", ja.optBigInteger(1, null));
+        JSONObject jo = new JSONObject("{\"x\":-1e100000000}");
+        assertNull("negative huge exponent", jo.optBigInteger("x", null));
+
+        // a BigDecimal put() directly (not via the parser) is bounded too
+        JSONObject jo2 = new JSONObject();
+        jo2.put("x", new BigDecimal("1e100000000"));
+        assertNull("put BigDecimal huge exponent", jo2.optBigInteger("x", null));
+
+        // just over the boundary: 1001 integer digits is rejected
+        JSONObject jo3 = new JSONObject("{\"x\":1e1000}");
+        assertNull("1e1000 has 1001 digits and is rejected", jo3.optBigInteger("x", null));
+    }
+
+    /**
+     * Exploit regression for CVE-2026-59171: a huge NEGATIVE exponent such as
+     * 1e-100000000 is just as short, and BigDecimal.toBigInteger() would build a
+     * 10^100000000 divisor to truncate it. Its integer part is zero, so the
+     * conversion must return zero promptly.
+     */
+    @Test(timeout = 5000)
+    public void getBigIntegerHugeNegativeExponentReturnsZero() {
+        // BigDecimal path: value arrives via the parser as a BigDecimal
+        JSONObject jo = new JSONObject("{\"x\":1e-100000000,\"y\":-1e-100000000}");
+        assertTrue("tiny-exponent literal parses to BigDecimal", jo.get("x") instanceof BigDecimal);
+        assertEquals(BigInteger.ZERO, jo.getBigInteger("x"));
+        assertEquals(BigInteger.ZERO, jo.optBigInteger("x", BigInteger.ONE));
+        assertEquals(BigInteger.ZERO, jo.getBigInteger("y"));
+
+        // String path: isDecimalNotation branch of objectToBigInteger
+        JSONObject jo2 = new JSONObject();
+        jo2.put("x", "1e-100000000");
+        assertEquals(BigInteger.ZERO, jo2.optBigInteger("x", BigInteger.ONE));
+
+        // JSONArray accessors delegate to the same helper
+        JSONArray ja = new JSONArray("[1e-100000000]");
+        assertEquals(BigInteger.ZERO, ja.getBigInteger(0));
+        assertEquals(BigInteger.ZERO, ja.optBigInteger(0, BigInteger.ONE));
+
+        // zero with a huge exponent is still zero
+        JSONObject jo3 = new JSONObject("{\"x\":0e100000000}");
+        assertEquals(BigInteger.ZERO, jo3.getBigInteger("x"));
+
+        // truncation toward zero is unchanged for ordinary values
+        JSONObject jo4 = new JSONObject("{\"a\":0.5,\"b\":-0.5,\"c\":123.999,\"d\":-123.999,\"e\":1.5e3}");
+        assertEquals(BigInteger.ZERO, jo4.getBigInteger("a"));
+        assertEquals(BigInteger.ZERO, jo4.getBigInteger("b"));
+        assertEquals(new BigInteger("123"), jo4.getBigInteger("c"));
+        assertEquals(new BigInteger("-123"), jo4.getBigInteger("d"));
+        assertEquals(new BigInteger("1500"), jo4.getBigInteger("e"));
+    }
+
+    /**
      * The purpose for the static method getNames() methods are not clear.
      * This method is not called from within JSON-Java. Most likely
      * uses are to prep names arrays for:  
@@ -3519,5 +3622,370 @@ public class JSONObjectTest {
         JSONObject json_input = new JSONObject(tokener);
         assertNotNull(json_input);
         fail("Excepected Exception.");
+    }
+
+    @Test
+    public void testMaxNumberLength() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 100; ++i) {
+            sb.append("9999999999");
+        }
+
+        // edge case: JSONObject with number just under the max length limit
+        String s1Object = "{ \"a\": " + sb + "}";
+        JSONObject jsonObject1 = new JSONObject(s1Object);
+        Object obj1Object = jsonObject1.get("a");
+        assertTrue(obj1Object instanceof Number);
+        assertEquals(1000, obj1Object.toString().length());
+
+        // edge case: JSONArray with number just under the max length limit
+        String s1Array = "[" + sb + "]";
+        JSONArray jsonArray1 = new JSONArray(s1Array);
+        Object obj1Array = jsonArray1.get(0);
+        assertTrue(obj1Array instanceof Number);
+        assertEquals(1000, obj1Array.toString().length());
+
+        // edge case: JSONObject with number just over the max length limit
+        String s2Object = "{ \"a\": " + sb + "9}";
+        JSONObject jsonObject2 = new JSONObject(s2Object);
+        Object obj2Object = jsonObject2.get("a");
+        assertTrue(obj2Object instanceof String);
+        assertEquals(1001, ((String) obj2Object).length());
+
+        // edge case: JSONArray with number just over the max length limit
+        String s2Array = "[" + sb + "9]";
+        JSONArray jsonArray2 = new JSONArray(s2Array);
+        Object obj2Array = jsonArray2.get(0);
+        assertTrue(obj2Array instanceof String);
+        assertEquals(1001, ((String) obj2Array).length());
+    }
+
+    /**
+     * Test max number length for negative integer strings via stringToValue.
+     */
+    @Test
+    public void testMaxNumberLengthNegativeInteger() {
+        // Build a negative number string of exactly 1000 chars: "-" + 999 digits
+        StringBuilder sb = new StringBuilder("-");
+        for (int i = 0; i < 999; ++i) {
+            sb.append("1");
+        }
+        assertEquals(1000, sb.length());
+
+        // at max length: parsed as number
+        JSONObject jo = new JSONObject("{ \"a\": " + sb + "}");
+        Object val = jo.get("a");
+        assertTrue("Expected Number but got " + val.getClass(), val instanceof Number);
+
+        // over max length: returned as string
+        sb.append("1");
+        assertEquals(1001, sb.length());
+        JSONObject jo2 = new JSONObject("{ \"a\": " + sb + "}");
+        Object val2 = jo2.get("a");
+        assertTrue("Expected String but got " + val2.getClass(), val2 instanceof String);
+    }
+
+    /**
+     * Test max number length for decimal notation strings via stringToValue.
+     */
+    @Test
+    public void testMaxNumberLengthDecimal() {
+        // Build a decimal number string of exactly 1000 chars: 499 digits + "." + 500
+        // digits
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 499; ++i) {
+            sb.append("1");
+        }
+        sb.append(".");
+        for (int i = 0; i < 500; ++i) {
+            sb.append("2");
+        }
+        assertEquals(1000, sb.length());
+
+        // at max length: parsed as number (BigDecimal)
+        JSONObject jo = new JSONObject("{ \"a\": " + sb + "}");
+        Object val = jo.get("a");
+        assertTrue("Expected Number but got " + val.getClass(), val instanceof Number);
+
+        // over max length: returned as string
+        sb.append("3");
+        assertEquals(1001, sb.length());
+        JSONObject jo2 = new JSONObject("{ \"a\": " + sb + "}");
+        Object val2 = jo2.get("a");
+        assertTrue("Expected String but got " + val2.getClass(), val2 instanceof String);
+    }
+
+    /**
+     * Test max number length with scientific notation via stringToValue.
+     */
+    @Test
+    public void testMaxNumberLengthScientificNotation() {
+        // Build a scientific notation string of exactly 1000 chars
+        StringBuilder sb = new StringBuilder("1.");
+        for (int i = 0; i < 994; ++i) {
+            sb.append("0");
+        }
+        sb.append("e100");
+        assertEquals(1000, sb.length());
+
+        // at max length: parsed as number
+        JSONObject jo = new JSONObject("{ \"a\": " + sb + "}");
+        Object val = jo.get("a");
+        assertTrue("Expected Number but got " + val.getClass(), val instanceof Number);
+
+        // over max length: returned as string
+        sb = new StringBuilder("1.");
+        for (int i = 0; i < 995; ++i) {
+            sb.append("0");
+        }
+        sb.append("e100");
+        assertEquals(1001, sb.length());
+        JSONObject jo2 = new JSONObject("{ \"a\": " + sb + "}");
+        Object val2 = jo2.get("a");
+        assertTrue("Expected String but got " + val2.getClass(), val2 instanceof String);
+    }
+
+    /**
+     * Test that optBigDecimal handles various numeric types correctly.
+     */
+    @Test
+    public void testOptBigDecimalVariousTypes() {
+        BigDecimal defaultVal = BigDecimal.valueOf(-1);
+        JSONObject jo = new JSONObject();
+
+        // BigDecimal passthrough
+        jo.put("bd", new BigDecimal("123.456"));
+        assertEquals(new BigDecimal("123.456"), jo.optBigDecimal("bd", defaultVal));
+
+        // BigInteger conversion
+        jo.put("bi", new BigInteger("999"));
+        assertEquals(new BigDecimal(new BigInteger("999")), jo.optBigDecimal("bi", defaultVal));
+
+        // Double conversion
+        jo.put("d", 3.14);
+        BigDecimal bdResult = jo.optBigDecimal("d", defaultVal);
+        assertNotEquals(defaultVal, bdResult);
+
+        // Float conversion (via JSONObject, floats are stored as doubles)
+        jo.put("f", 2.5f);
+        BigDecimal fResult = jo.optBigDecimal("f", defaultVal);
+        assertNotEquals(defaultVal, fResult);
+
+        // Long conversion
+        jo.put("l", 123456789L);
+        assertEquals(new BigDecimal(123456789L), jo.optBigDecimal("l", defaultVal));
+
+        // Integer conversion
+        jo.put("i", 42);
+        assertEquals(new BigDecimal(42), jo.optBigDecimal("i", defaultVal));
+
+        // JSONObject.NULL returns default
+        jo.put("null", JSONObject.NULL);
+        assertEquals(defaultVal, jo.optBigDecimal("null", defaultVal));
+
+        // Missing key returns default
+        assertEquals(defaultVal, jo.optBigDecimal("missing", defaultVal));
+
+        // Non-numeric string returns default
+        jo.put("str", "not a number");
+        assertEquals(defaultVal, jo.optBigDecimal("str", defaultVal));
+
+        // Verify that non-finite doubles are rejected by put()
+        try {
+            jo.put("nan", Double.NaN);
+            fail("Expected JSONException for NaN");
+        } catch (JSONException expected) {
+        }
+        try {
+            jo.put("inf", Double.POSITIVE_INFINITY);
+            fail("Expected JSONException for positive infinity");
+        } catch (JSONException expected) {
+        }
+        try {
+            jo.put("ninf", Double.NEGATIVE_INFINITY);
+            fail("Expected JSONException for negative infinity");
+        } catch (JSONException expected) {
+        }
+    }
+
+    /**
+     * Test that optBigInteger handles various numeric types and decimal notation.
+     */
+    @Test
+    public void testOptBigIntegerVariousTypes() {
+        BigInteger defaultVal = BigInteger.valueOf(-1);
+        JSONObject jo = new JSONObject();
+
+        // BigInteger passthrough
+        jo.put("bi", new BigInteger("999"));
+        assertEquals(new BigInteger("999"), jo.optBigInteger("bi", defaultVal));
+
+        // BigDecimal conversion (truncates)
+        jo.put("bd", new BigDecimal("123.999"));
+        assertEquals(new BigInteger("123"), jo.optBigInteger("bd", defaultVal));
+
+        // Double conversion
+        jo.put("d", 3.14);
+        BigInteger dResult = jo.optBigInteger("d", defaultVal);
+        assertNotEquals(defaultVal, dResult);
+
+        // Long conversion
+        jo.put("l", 123456789L);
+        assertEquals(BigInteger.valueOf(123456789L), jo.optBigInteger("l", defaultVal));
+
+        // Integer conversion
+        jo.put("i", 42);
+        assertEquals(BigInteger.valueOf(42), jo.optBigInteger("i", defaultVal));
+
+        // JSONObject.NULL returns default
+        jo.put("null", JSONObject.NULL);
+        assertEquals(defaultVal, jo.optBigInteger("null", defaultVal));
+
+        // Missing key returns default
+        assertEquals(defaultVal, jo.optBigInteger("missing", defaultVal));
+
+        // Non-numeric string returns default
+        jo.put("str", "not a number");
+        assertEquals(defaultVal, jo.optBigInteger("str", defaultVal));
+
+        // Verify that non-finite doubles are rejected by put()
+        try {
+            jo.put("nan", Double.NaN);
+            fail("Expected JSONException for NaN");
+        } catch (JSONException expected) {
+        }
+        try {
+            jo.put("inf", Double.POSITIVE_INFINITY);
+            fail("Expected JSONException for positive infinity");
+        } catch (JSONException expected) {
+        }
+
+        // Decimal notation string: goes through BigDecimal→BigInteger path in
+        // objectToBigInteger
+        jo.put("decstr", "123.456");
+        assertEquals(new BigInteger("123"), jo.optBigInteger("decstr", defaultVal));
+    }
+
+    /**
+     * Test max number length for XML parsing via XML.toJSONObject.
+     */
+    @Test
+    public void testMaxNumberLengthXML() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 100; ++i) {
+            sb.append("9999999999");
+        }
+
+        // at max length: parsed as number
+        String xml1 = "<a>" + sb + "</a>";
+        JSONObject jo1 = XML.toJSONObject(xml1);
+        Object val1 = jo1.get("a");
+        assertTrue("Expected Number but got " + val1.getClass(), val1 instanceof Number);
+
+        // over max length: returned as string
+        sb.append("9");
+        String xml2 = "<a>" + sb + "</a>";
+        JSONObject jo2 = XML.toJSONObject(xml2);
+        Object val2 = jo2.get("a");
+        assertTrue("Expected String but got " + val2.getClass(), val2 instanceof String);
+    }
+
+    /**
+     * Test stringToValue with small numbers, booleans, null, and non-numeric
+     * strings.
+     */
+    @Test
+    public void testStringToValueViaJSONObject() {
+        // Integer range number
+        JSONObject jo = new JSONObject("{\"a\": 42}");
+        Object val = jo.get("a");
+        assertTrue("Expected Integer", val instanceof Integer);
+        assertEquals(42, val);
+
+        // Long range number
+        jo = new JSONObject("{\"a\": 2147483648}");
+        val = jo.get("a");
+        assertTrue("Expected Long", val instanceof Long);
+        assertEquals(2147483648L, val);
+
+        // BigInteger range number
+        jo = new JSONObject("{\"a\": 9999999999999999999}");
+        val = jo.get("a");
+        assertTrue("Expected BigInteger", val instanceof BigInteger);
+
+        // Negative zero → treated as decimal notation
+        jo = new JSONObject("{\"a\": -0}");
+        val = jo.get("a");
+        assertTrue("Expected Double for -0", val instanceof Double);
+        assertEquals(-0.0, (Double) val, 0.0);
+
+        // Decimal number
+        jo = new JSONObject("{\"a\": 3.14}");
+        val = jo.get("a");
+        assertTrue("Expected BigDecimal", val instanceof BigDecimal);
+    }
+
+    /**
+     * Test stringToNumber rejects invalid number formats (octal-like).
+     */
+    @Test
+    public void testStringToNumberInvalidFormats() {
+        // Leading zero followed by digit → treated as string (not octal)
+        JSONObject jo = new JSONObject("{\"a\": 01}");
+        // JSONTokener with strict mode would reject, but default mode stores as string
+        // since stringToNumber throws NumberFormatException for "01"
+        Object val = jo.get("a");
+        assertTrue("01 should be stored as string, got " + val.getClass(), val instanceof String);
+
+        // Negative with leading zero → "-01"
+        jo = new JSONObject("{\"a\": -01}");
+        val = jo.get("a");
+        assertTrue("-01 should be stored as string, got " + val.getClass(), val instanceof String);
+    }
+
+    /**
+     * Exploit regression for CVE-2026-59171: a 1 000 000 digit numeric literal
+     * would make new BigInteger / new BigDecimal run for many seconds (the
+     * conversion is superlinear). Every JSON entry point must keep it as a
+     * String and return promptly.
+     */
+    @Test(timeout = 10000)
+    public void hugeNumericLiteralIsNotConvertedToNumber() {
+        String digits = hugeDigitString(1000000);
+        String decimal = "1." + digits;
+
+        Object value = new JSONObject("{\"x\":" + digits + "}").get("x");
+        assertTrue("JSONObject: expected String but got " + value.getClass(), value instanceof String);
+        assertEquals(digits, value);
+
+        value = new JSONObject("{\"x\":-" + decimal + "}").get("x");
+        assertTrue("JSONObject decimal: expected String but got " + value.getClass(), value instanceof String);
+
+        value = new JSONArray("[" + digits + "]").get(0);
+        assertTrue("JSONArray: expected String but got " + value.getClass(), value instanceof String);
+        assertEquals(digits, value);
+
+        value = new JSONArray("[" + decimal + "]").get(0);
+        assertTrue("JSONArray decimal: expected String but got " + value.getClass(), value instanceof String);
+
+        value = new JSONTokener(digits).nextValue();
+        assertTrue("JSONTokener: expected String but got " + value.getClass(), value instanceof String);
+
+        value = JSONObject.stringToValue(digits);
+        assertTrue("stringToValue: expected String but got " + value.getClass(), value instanceof String);
+    }
+
+    /**
+     * Builds a string of the given number of '9' digits.
+     *
+     * @param length number of digits
+     * @return the digit string
+     */
+    private static String hugeDigitString(int length) {
+        StringBuilder sb = new StringBuilder(length);
+        for (int i = 0; i < length; ++i) {
+            sb.append('9');
+        }
+        return sb.toString();
     }
 }

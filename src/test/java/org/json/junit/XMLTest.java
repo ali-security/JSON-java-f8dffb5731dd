@@ -1198,4 +1198,63 @@ public class XMLTest {
         assertTrue("Wrong throwable thrown: not expecting message <" + thrown.getMessage() + ">",
             thrown.getMessage().startsWith("Maximum nesting depth of 512 reached"));
     }
+
+    /**
+     * Exploit regression for CVE-2026-59171: a 1 000 000 digit numeric value
+     * would make new BigInteger / new BigDecimal run for many seconds (the
+     * conversion is superlinear). Element content and attribute values must
+     * be kept as Strings and returned promptly, on every XML entry point.
+     */
+    @Test(timeout = 10000)
+    public void hugeNumericValueIsNotConvertedToNumber() {
+        StringBuilder sb = new StringBuilder(1000000);
+        for (int i = 0; i < 1000000; ++i) {
+            sb.append('9');
+        }
+        String digits = sb.toString();
+
+        // element content
+        Object value = XML.toJSONObject("<x>" + digits + "</x>").get("x");
+        assertTrue("content: expected String but got " + value.getClass(), value instanceof String);
+        assertEquals(digits, value);
+
+        // decimal element content
+        value = XML.toJSONObject("<x>-1." + digits + "</x>").get("x");
+        assertTrue("decimal content: expected String but got " + value.getClass(), value instanceof String);
+
+        // attribute value
+        value = XML.toJSONObject("<x a=\"" + digits + "\"/>").getJSONObject("x").get("a");
+        assertTrue("attribute: expected String but got " + value.getClass(), value instanceof String);
+        assertEquals(digits, value);
+
+        // Reader + explicit configuration entry point
+        value = XML.toJSONObject(new StringReader("<x>" + digits + "</x>"),
+                new XMLParserConfiguration().withKeepStrings(false)).get("x");
+        assertTrue("reader: expected String but got " + value.getClass(), value instanceof String);
+
+        // the public helper itself
+        value = XML.stringToValue(digits);
+        assertTrue("stringToValue: expected String but got " + value.getClass(), value instanceof String);
+    }
+
+    /**
+     * Max number length boundary for XML attribute values (CVE-2026-59171).
+     */
+    @Test
+    public void testMaxNumberLengthXMLAttribute() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 100; ++i) {
+            sb.append("9999999999");
+        }
+
+        // at max length: parsed as number
+        Object val1 = XML.toJSONObject("<a b=\"" + sb + "\"/>").getJSONObject("a").get("b");
+        assertTrue("Expected Number but got " + val1.getClass(), val1 instanceof Number);
+
+        // over max length: returned as string
+        sb.append("9");
+        Object val2 = XML.toJSONObject("<a b=\"" + sb + "\"/>").getJSONObject("a").get("b");
+        assertTrue("Expected String but got " + val2.getClass(), val2 instanceof String);
+        assertEquals(sb.toString(), val2);
+    }
 }

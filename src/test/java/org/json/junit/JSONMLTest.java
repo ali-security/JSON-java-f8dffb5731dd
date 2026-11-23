@@ -1131,4 +1131,40 @@ public class JSONMLTest {
             thrown.getMessage().startsWith("Maximum nesting depth of 512 reached"));
     }
 
+    /**
+     * Exploit regression for CVE-2026-59171: a 1 000 000 digit numeric value
+     * would make new BigInteger run for many seconds (the conversion is
+     * superlinear). JSONML attribute values and content must be kept as
+     * Strings and returned promptly.
+     */
+    @Test(timeout = 10000)
+    public void hugeNumericValueIsNotConvertedToNumber() {
+        StringBuilder sb = new StringBuilder(1000000);
+        for (int i = 0; i < 1000000; ++i) {
+            sb.append('9');
+        }
+        String digits = sb.toString();
+        String xml = "<x a=\"" + digits + "\">" + digits + "</x>";
+
+        // array form: ["x", {"a": ...}, ...]
+        JSONArray jsonArray = JSONML.toJSONArray(xml);
+        Object attribute = jsonArray.getJSONObject(1).get("a");
+        assertTrue("toJSONArray attribute: expected String but got " + attribute.getClass(),
+                attribute instanceof String);
+        assertEquals(digits, attribute);
+        Object content = jsonArray.get(2);
+        assertTrue("toJSONArray content: expected String but got " + content.getClass(),
+                content instanceof String);
+        assertEquals(digits, content);
+
+        // object form: {"tagName": "x", "a": ..., "childNodes": [...]}
+        JSONObject jsonObject = JSONML.toJSONObject(xml);
+        attribute = jsonObject.get("a");
+        assertTrue("toJSONObject attribute: expected String but got " + attribute.getClass(),
+                attribute instanceof String);
+        content = jsonObject.getJSONArray("childNodes").get(0);
+        assertTrue("toJSONObject content: expected String but got " + content.getClass(),
+                content instanceof String);
+    }
+
 }
